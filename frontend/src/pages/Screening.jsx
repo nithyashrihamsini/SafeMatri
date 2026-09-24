@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { SYMPTOMS } from "../data/symptoms";
 import { submitScreening } from "../api/client";
-
+import VoiceInput from "../components/VoiceInput";
 const empty = {
   name: "", age: "", weeks: "", phone: "",
   systolic: "", diastolic: "", location: null, symptoms: [],
@@ -24,7 +24,9 @@ export default function Screening() {
       symptoms: has ? form.symptoms.filter((s) => s !== id) : [...form.symptoms, id],
     });
   };
-
+const addVoiceSymptoms = (ids) => {
+  setForm((f) => ({ ...f, symptoms: Array.from(new Set([...f.symptoms, ...ids])) }));
+};
   const shareLocation = () => {
     if (!navigator.geolocation) return setLocMsg("Location not supported on this device.");
     setLocMsg("Getting location...");
@@ -87,9 +89,10 @@ export default function Screening() {
           </div>
         </div>
       </div>
-
+<VoiceInput onSymptoms={addVoiceSymptoms} />
       <div className="card">
         <h3 style={{ marginBottom: 12 }}>Are you having any of these?</h3>
+        
         <div className="symptom-grid">
           {SYMPTOMS.map((s) => {
             const checked = form.symptoms.includes(s.id);
