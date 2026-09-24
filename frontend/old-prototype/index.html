@@ -221,7 +221,7 @@ const CFG = { weights: { LOW: 10, MODERATE: 50, HIGH: 100 }, emergencyWeight: 10
    2. STATE
    ===================================================================== */
 const state = {
-  view: "woman", step: "tell", words: "", selected: new Set(), detected: [], voiceMsg: "",
+  view: "woman", step: "tell", words: "", selected: new Set(), detected: [], voiceMsg: "", lang: "ta", voice: null, busy: false,
   form: { name: "", area: "A", consent: false, realLoc: false }, sending: false, sentCase: null,
   dashTab: "queue", viewAs: "ALL", openId: null, offsetMin: 0,
 };
@@ -256,6 +256,7 @@ function buildReport(c) {
   L.push("");
   L.push("In her own words:");
   L.push(c.words ? "\"" + c.words + "\"" : "(No description given. Signs were chosen from the list.)");
+  if (c.english && c.english !== c.words) { L.push("English translation:"); L.push("\"" + c.english + "\""); }
   L.push("");
   L.push("Signs reported (her words -> suggested clinical term):");
   if (c.symptoms.length) c.symptoms.forEach(k => L.push("- " + SYM[k].label + "  ->  " + SYM[k].term));
@@ -281,7 +282,7 @@ function createCase(o) {
   const res = evaluate(o.symptoms);
   const area = AREAS[o.area];
   const c = {
-    id: o.area + "-" + (++seq), name: (o.name || "").trim(), area: o.area, words: (o.words || "").trim(),
+    id: o.area + "-" + (++seq), name: (o.name || "").trim(), area: o.area, words: (o.words || "").trim(), english: (o.english || "").trim(),
     symptoms: [...o.symptoms], risk: res.risk, emergency: res.emergency, reasons: res.reasons,
     location: o.location, createdAt: o.createdAt === undefined ? now() : o.createdAt, status: o.status || "new",
     assignedTo: area.worker || CLINIC, fallback: !area.worker,
@@ -329,24 +330,98 @@ function seedDemo() {
    ===================================================================== */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let rec = null, listening = false;
-function applyDetect() {
-  const found = detect(state.words);
+const LANGS = [
+  { code: "ta", speech: "ta-IN", label: "Tamil (தமிழ்)" },
+  { code: "hi", speech: "hi-IN", label: "Hindi (हिन्दी)" },
+  { code: "te", speech: "te-IN", label: "Telugu (తెలుగు)" },
+  { code: "kn", speech: "kn-IN", label: "Kannada (ಕನ್ನಡ)" },
+  { code: "ml", speech: "ml-IN", label: "Malayalam (മലയാളം)" },
+  { code: "en", speech: "en-IN", label: "English" },
+];
+const langName = c => (LANGS.find(l => l.code === c) || { label: c }).label.split(" (")[0];
+const DEMO_PHRASES = {
+  ta: "எனக்கு தலைவலி இருக்கு, பார்வை மங்கலா இருக்கு, குழந்தை அசைவு குறைவா இருக்கு",
+  hi: "मुझे सिरदर्द है, धुंधला दिखता है और बुखार भी है",
+  te: "నాకు తలనొప్పి ఉంది, జ్వరం కూడా ఉంది",
+  kn: "ನನಗೆ ತಲೆನೋವು ಇದೆ",
+  ml: "എനിക്ക് തലവേദന ഉണ്ട്",
+  en: "My head is paining a lot and my vision is blurry",
+};
+
+// Detects the language from the script of the text
+function detectLang(t) {
+  if (/[\u0B80-\u0BFF]/.test(t)) return "ta";
+  if (/[\u0900-\u097F]/.test(t)) return "hi";
+  if (/[\u0C00-\u0C7F]/.test(t)) return "te";
+  if (/[\u0C80-\u0CFF]/.test(t)) return "kn";
+  if (/[\u0D00-\u0D7F]/.test(t)) return "ml";
+  return "en";
+}
+
+// Free demo translation service (MyMemory). A real deployment would use a paid translation API.
+async function translateText(text, from, to) {
+  if (from === to) return text;
+  try {
+    const url = "https://api.mymemory.translated.net/get?q=" + encodeURIComponent(text) + "&langpair=" + from + "|" + to;
+    const res = await fetch(url);
+    const data = await res.json();
+    const out = data && data.responseData && data.responseData.translatedText;
+    return out ? out : "(translation unavailable)";
+  } catch (e) {
+    return "(translation unavailable, check internet)";
+  }
+}
+
+// Backup keyword matching in the woman's own language, so signs are still found if translation fails
+const NATIVE_LEX = [
+  ["heavy_bleeding",        /இரத்தப்போக்கு|ரத்தப்போக்கு|रक्तस्राव|खून बह|ರಕ್ತಸ್ರಾವ|రక్తస్రావం|രക്തസ്രാവം/],
+  ["convulsions",           /வலிப்பு|दौरे|झटके|मिर्गी|ಸೆಳೆತ|మూర్ఛ|അപസ്മാരം/],
+  ["difficulty_breathing",  /மூச்சு திணறல்|மூச்சு விட|சுவாச|सांस (लेने|फूल)|ಉಸಿರಾಟ|ఊపిరి|ശ്വാസം/],
+  ["severe_headache",       /தலைவலி|தலை வலி|सिरदर्द|सिर दर्द|తలనొప్పి|ತಲೆನೋವು|തലവേദന/],
+  ["blurred_vision",        /மங்கல|பார்வை|धुंधल|नजर कमजोर|మసక|ಮಂಜು|കാഴ്ച/],
+  ["swelling_face_hands",   /(முகம்|கை).{0,15}(வீக்கம்|வீங்க)|(வீக்கம்|வீங்க).{0,15}(முகம்|கை)|चेहरे.{0,10}सूजन|हाथ.{0,10}सूजन/],
+  ["swollen_feet",          /கால்.{0,15}(வீக்கம்|வீங்க)|पैर.{0,10}सूजन/],
+  ["reduced_movement",      /அசைவு|हलचल|बच्चा.{0,15}हिल|శిశువు కదలిక|ಮಗು ಚಲನೆ|കുഞ്ഞ്.{0,10}അനക്കം/],
+  ["severe_abdominal_pain", /வயிற்று வலி|வயிறு வலி|வயிற்றில் வலி|पेट (में )?दर्द|కడుపు నొప్పి|ಹೊಟ್ಟೆ ನೋವು|വയറുവേദന/],
+  ["fluid_leak",            /தண்ணீர்.{0,15}(வரு|கசி|ஒழுக)|पानी.{0,10}(निकल|रिस)/],
+  ["fever",                 /காய்ச்சல்|बुखार|జ్వరం|ಜ್ವರ|പനി/],
+  ["mild_nausea",           /வாந்தி|சோர்வு|उल्टी|कमजोरी|थकान/],
+];
+function detectAll(text) {
+  const set = new Set(detect(text));
+  NATIVE_LEX.forEach(([k, re]) => { if (re.test(text || "")) set.add(k); });
+  return [...set];
+}
+
+async function processText(text) {
+  text = (text || "").trim();
+  if (!text) { state.voiceMsg = "Please speak or type something first."; render(); return; }
+  state.busy = true; state.voiceMsg = ""; render();
+  const from = detectLang(text);
+  const english = await translateText(text, from, "en");
+  const native = state.lang === "en" ? english : await translateText(text, from, state.lang);
+  const found = detectAll(text + " " + english);
   found.forEach(k => state.selected.add(k));
   state.detected = found;
+  state.voice = { text, from, english, native, lang: state.lang };
+  if (!found.length) state.voiceMsg = "We could not match that to a sign. Please tick the signs below.";
+  state.busy = false; render();
 }
+
 function toggleVoice() {
   if (!SR) return;
   if (listening && rec) { rec.stop(); return; }
   rec = new SR();
-  rec.lang = "en-IN"; rec.interimResults = true; rec.continuous = false;
+  rec.lang = (LANGS.find(l => l.code === state.lang) || LANGS[0]).speech;
+  rec.interimResults = true; rec.continuous = false;
   rec.onresult = e => {
     let t = "";
     for (let i = 0; i < e.results.length; i++) t += e.results[i][0].transcript;
     state.words = t;
     const el = document.getElementById("words"); if (el) el.value = t;
   };
-  rec.onend = () => { listening = false; applyDetect(); render(); };
-  rec.onerror = () => { listening = false; state.voiceMsg = "Voice input did not work here. You can type or tap instead."; render(); };
+  rec.onend = () => { listening = false; render(); if (state.words.trim()) processText(state.words); };
+  rec.onerror = () => { listening = false; state.voiceMsg = "Voice input did not work here. You can type, tap, or use the demo phrase."; render(); };
   state.voiceMsg = ""; listening = true; rec.start(); render();
 }
 
@@ -362,17 +437,25 @@ function viewTell() {
   }).join("");
   const picked = state.detected.length
     ? '<div class="picked" role="status">We picked up: <strong>' + state.detected.map(k => esc(SYM[k].short)).join(", ") + ".</strong> Please check the list below and change it if needed.</div>" : "";
+  const vp = state.voice
+    ? '<div class="picked" role="status"><strong>Language detected:</strong> ' + esc(langName(state.voice.from)) +
+      '<br><strong>English:</strong> ' + esc(state.voice.english) +
+      (state.voice.lang !== "en" ? '<br><strong>' + esc(langName(state.voice.lang)) + ':</strong> ' + esc(state.voice.native) : "") + "</div>"
+    : "";
   return '<h1>How are you feeling today?</h1>' +
     '<p class="lead">Tell us in your own words, by voice or by typing. Then check the signs below.</p>' +
     '<div class="sos">Heavy bleeding, fits, or trouble breathing? Go to the hospital now. Do not wait.</div>' +
+    '<label class="lbl" for="lang">Her language</label><select id="lang" data-bind="lang">' +
+      LANGS.map(l => '<option value="' + l.code + '"' + (state.lang === l.code ? " selected" : "") + ">" + esc(l.label) + "</option>").join("") + "</select>" +
     '<label class="lbl" for="words">In your own words</label>' +
     '<textarea id="words" data-bind="words" rows="3" placeholder="For example: my head is paining a lot and my vision is blurry">' + esc(state.words) + "</textarea>" +
     '<div class="row">' +
       (SR ? '<button type="button" class="btn secondary" data-act="voice">' + MIC + (listening ? "Stop listening" : "Speak") + "</button>" : "") +
-      '<button type="button" class="btn secondary" data-act="detect">Find signs from what I said</button>' +
+      '<button type="button" class="btn secondary" data-act="detect"' + (state.busy ? " disabled" : "") + '>Find signs from what I said</button>' +
+      '<button type="button" class="btn ghost" data-act="demo"' + (state.busy ? " disabled" : "") + '>Try demo phrase</button>' +
     "</div>" +
-    '<p class="small" aria-live="polite">' + (state.voiceMsg ? esc(state.voiceMsg) : SR ? "Voice input usually needs an internet connection in the browser." : "Voice input is not available in this browser. You can type or tap instead.") + "</p>" +
-    picked +
+    '<p class="small" aria-live="polite">' + (state.busy ? "Detecting language and translating..." : state.voiceMsg ? esc(state.voiceMsg) : SR ? "Voice input usually needs an internet connection in the browser." : "Voice input is not available in this browser. You can type or tap instead.") + "</p>" +
+    vp + picked +
     '<h3 style="margin-top:14px">Which of these do you have right now?</h3>' +
     '<p class="small">Tick all that apply. Leave it empty if none apply.</p>' +
     '<div class="chips">' + chips + "</div>" +
@@ -484,7 +567,7 @@ function render() {
   document.getElementById("app").innerHTML = state.view === "woman" ? viewWoman() : viewWorker();
 }
 function resetWoman() {
-  state.step = "tell"; state.words = ""; state.selected = new Set(); state.detected = []; state.voiceMsg = "";
+  state.step = "tell"; state.words = ""; state.selected = new Set(); state.detected = []; state.voiceMsg = ""; state.voice = null; state.busy = false;
   state.form = { name: "", area: "A", consent: false, realLoc: false }; state.sending = false; state.sentCase = null;
 }
 function getLocation(area, real) {
@@ -499,7 +582,7 @@ async function sendAlert() {
   if (!state.form.consent || state.sending) return;
   state.sending = true; render();
   const location = await getLocation(state.form.area, state.form.realLoc);
-  state.sentCase = createCase({ name: state.form.name, area: state.form.area, words: state.words, symptoms: [...state.selected], location });
+  state.sentCase = createCase({ name: state.form.name, area: state.form.area, words: state.words, english: state.voice ? state.voice.english : "", symptoms: [...state.selected], location });
   state.sending = false; state.step = "sent"; window.scrollTo(0, 0); render();
 }
 
@@ -511,7 +594,8 @@ document.addEventListener("click", e => {
   if (a === "view") { state.view = t.dataset.v; window.scrollTo(0, 0); render(); }
   else if (a === "toggle") { const k = t.dataset.k; state.selected.has(k) ? state.selected.delete(k) : state.selected.add(k); render(); }
   else if (a === "voice") toggleVoice();
-  else if (a === "detect") { applyDetect(); if (!state.detected.length) state.voiceMsg = "We could not match that to a sign. Please tick the signs below."; else state.voiceMsg = ""; render(); }
+  else if (a === "detect") processText(state.words);
+  else if (a === "demo") { state.words = DEMO_PHRASES[state.lang]; processText(state.words); }
   else if (a === "check") { state.step = "result"; window.scrollTo(0, 0); render(); }
   else if (a === "back") { state.step = "tell"; window.scrollTo(0, 0); render(); }
   else if (a === "restart") { resetWoman(); window.scrollTo(0, 0); render(); }
@@ -533,6 +617,7 @@ document.addEventListener("change", e => {
   if (!b) return;
   if (b === "consent" || b === "realLoc") { state.form[b] = e.target.checked; render(); }
   else if (b === "area") state.form.area = e.target.value;
+  else if (b === "lang") state.lang = e.target.value;
   else if (b === "viewAs") { state.viewAs = e.target.value; render(); }
 });
 // keep waiting times fresh on the dashboard
